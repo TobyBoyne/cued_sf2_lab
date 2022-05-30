@@ -2,7 +2,7 @@
 With thanks to 2019 SF2 Group 7 (Jason Li - jl944@cam.ac.uk, Karthik Suresh -
 ks800@cam.ac.uk), who did the bulk of the porting from matlab to Python.
 """
-from typing import Tuple, Optional
+from typing import Tuple, NamedTuple, Optional
 
 import numpy as np
 from .laplacian_pyramid import quant1, quant2
@@ -112,7 +112,55 @@ def runampl(a: np.ndarray) -> np.ndarray:
     return ra
 
 
-def huffdflt(typ: int) -> Tuple[np.ndarray, np.ndarray]:
+class HuffmanTable(NamedTuple):
+    """A huffman table stored in sorted order
+    
+    Attributes:
+        bits: The number of values per bit level, shape ``(16,)``.
+        huffval: The codes sorted by bit length, shape ``(162,)``.
+    """
+    bits: np.ndarray
+    huffval: np.ndarray
+
+    @property
+    def codes(self) -> np.ndarray:
+        """ Produce an array of codewords corresponding to the requested bit lengths"""
+        ncodes = len(self.huffval)
+        if np.sum(self.bits) != ncodes:
+            raise ValueError("bits and huffvals disagree")
+
+        # Generate huffman size table (JPEG fig C1, p78):
+        k = 0
+        huffsize = np.zeros(ncodes, dtype=int)
+        for i, b in enumerate(self.bits):
+            huffsize[k:k+b] = i + 1
+            k += b
+
+        huffcode = np.zeros(ncodes, dtype=int)
+        code = 0
+        si = huffsize[0]
+
+        # Generate huffman code table (JPEG fig C2, p79)
+        for k in range(ncodes):
+            while huffsize[k] > si:
+                code = code * 2
+                si += 1
+            huffcode[k] = code
+            code += 1
+
+        huff_bitwords = np.zeros(ncodes, dtype=bitword.dtype)
+        huff_bitwords['val'] = huffcode
+        huff_bitwords['bits'] = huffsize
+        return huff_bitwords
+
+def HuffmanTable__new__(cls, bits, huffval):
+    assert len(huffval) == sum(bits)
+    return super(cls, HuffmanTable).__new__(cls, (bits, huffval))
+
+HuffmanTable.__new__ = HuffmanTable__new__
+
+
+def huffdflt(typ: int) -> HuffmanTable:
     """
     Generates default JPEG huffman tables
 
@@ -190,11 +238,10 @@ def huffdflt(typ: int) -> Tuple[np.ndarray, np.ndarray]:
     bits = np.array([len(v) for v in vals], dtype=np.uint8)
     huffval = np.concatenate([np.array(v, dtype=np.uint8) for v in vals])
 
-    return bits, huffval
+    return HuffmanTable(bits, huffval)
 
 
-def huffgen(bits: np.ndarray, huffval: np.ndarray
-        ) -> Tuple[np.ndarray, np.ndarray]:
+def huffgen(t: HuffmanTable) -> Tuple[np.ndarray, np.ndarray]:
     """
     Generate huffman codes from a huffman table
 
@@ -207,38 +254,14 @@ def huffgen(bits: np.ndarray, huffval: np.ndarray
             first column lists the code for that value, and the second lists
             the length in bits.
     """
-    ncodes = len(huffval)
-    if np.sum(bits) != ncodes:
-        raise ValueError("bits and huffvals disagree")
-
-    # Generate huffman size table (JPEG fig C1, p78):
-    k = 0
-    huffsize = np.zeros(ncodes, dtype=int)
-    for i, b in enumerate(bits):
-        huffsize[k:k+b] = i + 1
-        k += b
-
-    huffcode = np.zeros(ncodes, dtype=int)
-    code = 0
-    si = huffsize[0]
-
-    # Generate huffman code table (JPEG fig C2, p79)
-    for k in range(ncodes):
-        while huffsize[k] > si:
-            code = code * 2
-            si += 1
-        huffcode[k] = code
-        code += 1
-
+    codes = t.codes
     # Reorder the code tables according to the data in
     # huffval to yield the encoder look-up tables.
-    ehuf = np.zeros((256, 2), dtype=int)
-    ehuf[huffval] = np.stack((huffcode, huffsize), axis=1)
+    ehuf = np.zeros(256, dtype=bitword.dtype)
+    ehuf[t.huffval] = codes
+    return codes['val'], np.stack((ehuf['val'], ehuf['bits']), axis=-1)
 
-    return huffcode, ehuf
-
-
-def huffdes(huffhist: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def huffdes(huffhist: np.ndarray) -> HuffmanTable:
     """
     Generates a JPEGhuffman table from a 256-point histogram of values.
 
@@ -246,10 +269,6 @@ def huffdes(huffhist: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
     Parameters:
         huffhist: the histogram of values
-
-    Returns:
-        bits: The number of values per bit level, shape ``(16,)``.
-        huffval: The codes sorted by bit length, shape ``(162,)``.
     """
 
     # Scale huffhist to sum just less than 32K, allowing for
@@ -336,9 +355,7 @@ def huffdes(huffhist: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         ii = np.where(codesize[t] == i)[0]
         huffval = np.concatenate((huffval, ii))
 
-    assert len(huffval) == sum(bits)
-
-    return bits, huffval
+    return HuffmanTable(bits, huffval)
 
 
 def huffenc(huffhist: np.ndarray, rsa: np.ndarray, ehuf: np.ndarray
@@ -491,7 +508,7 @@ def jpegenc(X: np.ndarray, qstep: float, N: int = 8, M: int = 8,
         vlc: variable length output codes, where ``vlc[:,0]`` are the codes and
             ``vlc[:,1]`` the number of corresponding valid bits, so that
             ``sum(vlc[:,1])`` gives the total number of bits in the image
-        bits, huffval: optional outputs containing the Huffman encoding
+        hufftab: optional outputs containing the Huffman encoding
             used in compression when `opthuff` is ``True``.
     '''
 
@@ -515,8 +532,8 @@ def jpegenc(X: np.ndarray, qstep: float, N: int = 8, M: int = 8,
     # On the first pass use default huffman tables.
     if log:
         print('Generating huffcode and ehuf using default tables')
-    dbits, dhuffval = huffdflt(1)  # Default tables.
-    huffcode, ehuf = huffgen(dbits, dhuffval)
+    dhufftab = huffdflt(1)  # Default tables.
+    huffcode, ehuf = huffgen(dhufftab)
 
     # Generate run/ampl values and code them into vlc(:,1:2).
     # Also generate a histogram of code symbols.
@@ -548,17 +565,15 @@ def jpegenc(X: np.ndarray, qstep: float, N: int = 8, M: int = 8,
     # Return here if the default tables are sufficient, otherwise repeat the
     # encoding process using the custom designed huffman tables.
     if not opthuff:
-        bits = dbits
-        huffval = dhuffval
         if log:
             print('Bits for coded image = {}'.format(sum(vlc[:, 1])))
-        return vlc, bits, huffval
+        return vlc, dhufftab
 
     # Design custom huffman tables.
     if log:
         print('Generating huffcode and ehuf using custom tables')
-    dbits, dhuffval = huffdes(huffhist)
-    huffcode, ehuf = huffgen(dbits, dhuffval)
+    dhufftab = huffdes(huffhist)
+    huffcode, ehuf = huffgen(dhufftab)
 
     # Generate run/ampl values and code them into vlc(:,1:2).
     # Also generate a histogram of code symbols.
@@ -586,16 +601,13 @@ def jpegenc(X: np.ndarray, qstep: float, N: int = 8, M: int = 8,
     if log:
         print('Bits for coded image = {}'.format(sum(vlc[:, 1])))
         print('Bits for huffman table = {}'.format(
-            (16 + max(dhuffval.shape))*8))
+            (16 + max(dhufftab.huffval.shape))*8))
 
-    bits = dbits
-    huffval = dhuffval
-
-    return vlc, bits, huffval
+    return vlc, dhufftab
 
 
 def jpegdec(vlc: np.ndarray, qstep: float, N: int = 8, M: int = 8,
-        bits: Optional[np.ndarray] = None, huffval: Optional[np.ndarray] = None,
+        hufftab: Optional[HuffmanTable] = None,
         dcbits: int = 8, W: int = 256, H: int = 256, log: bool = True
         ) -> np.ndarray:
     '''
@@ -609,7 +621,7 @@ def jpegdec(vlc: np.ndarray, qstep: float, N: int = 8, M: int = 8,
         M: width of each block to be coded (defaults to N). Must be an
             integer multiple of N - if it is larger, individual blocks are
             regrouped.
-        bits, huffval: if supplied, these will be used in Huffman decoding
+        hufftab: if supplied, these will be used in Huffman decoding
             of the data, otherwise default tables are used
         dcbits: the number of bits to use to decode the DC coefficients
             of the DCT
@@ -620,7 +632,7 @@ def jpegdec(vlc: np.ndarray, qstep: float, N: int = 8, M: int = 8,
         Z: the output greyscale image
     '''
 
-    opthuff = (huffval is not None and bits is not None)
+    opthuff = (hufftab is not None)
     if M % N != 0:
         raise ValueError('M must be an integer multiple of N!')
 
@@ -628,20 +640,19 @@ def jpegdec(vlc: np.ndarray, qstep: float, N: int = 8, M: int = 8,
     scan = diagscan(M)
 
     if opthuff:
-        if len(bits.shape) != 1:
+        if len(hufftab.bits.shape) != 1:
             raise ValueError('bits.shape must be (len(bits),)')
         if log:
             print('Generating huffcode and ehuf using custom tables')
     else:
         if log:
             print('Generating huffcode and ehuf using default tables')
-        bits, huffval = huffdflt(1)
-
+        hufftab = huffdflt(1)
     # Define starting addresses of each new code length in huffcode.
     # 0-based indexing instead of 1
-    huffstart = np.cumsum(np.block([0, bits[:15]]))
+    huffstart = np.cumsum(np.block([0, hufftab.bits[:15]]))
     # Set up huffman coding arrays.
-    huffcode, ehuf = huffgen(bits, huffval)
+    huffcode, ehuf = huffgen(hufftab)
 
     # Define array of powers of 2 from 1 to 2^16.
     k = 2 ** np.arange(17)
@@ -684,7 +695,7 @@ def jpegdec(vlc: np.ndarray, qstep: float, N: int = 8, M: int = 8,
 
                 # Decode run and size (in bits) of AC coef.
                 start = huffstart[vlc[i, 1] - 1]
-                res = huffval[start + vlc[i, 0] - huffcode[start]]
+                res = hufftab.huffval[start + vlc[i, 0] - huffcode[start]]
                 run += res // 16
                 cf += run + 1
                 si = res % 16
@@ -693,7 +704,7 @@ def jpegdec(vlc: np.ndarray, qstep: float, N: int = 8, M: int = 8,
                 # Decode amplitude of AC coef.
                 if vlc[i, 1] != si:
                     raise ValueError(
-                        'Problem with decoding .. you might be using the wrong bits and huffval tables')
+                        'Problem with decoding .. you might be using the wrong hufftab table')
                 ampl = vlc[i, 0]
 
                 # Adjust ampl for negative coef (i.e. MSB = 0).
