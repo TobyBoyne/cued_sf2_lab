@@ -44,7 +44,7 @@ def huffencopt(rsa: np.ndarray, ehuf: np.ndarray
         run = rsa[i, 0]
         # If run > 15, use repeated codes for 16 zeros.
         run, count16 = run % 16, run // 16
-        vlc += [ehuf[code] for _ in range(count16)]
+        vlc += [ehuf[15 * 16] for _ in range(count16)]
         # Code the run and size.
         code = run * 16 + rsa[i, 1]
         vlc.append(ehuf[code])

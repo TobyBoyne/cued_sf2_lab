@@ -10,6 +10,8 @@ from cued_sf2_lab.jpeg import diagscan, dwtgroup, huffdflt, HuffmanTable, huffen
 from encoding import huffblockhist, huffencopt
 from quantisation import quant, inv_quant
 
+from time import perf_counter
+
 
 # Image size func
 
@@ -186,25 +188,45 @@ class DWTCompression:
             dwtent += img_size(Yq[:h, h:m]) + img_size(Yq[h:m, :h]) + img_size(Yq[h:m, h:m])
 
         # Final low pass image
+
+        # Yq[128:, 128:] = 0
+
         m = 256//(2**self.n)
         Yq[:m, :m] = quant(Y[:m, :m], self.steps[0, self.n])
         self.ent = dwtent + img_size(Yq[:m, :m])
 
         return Yq.astype(int)
 
-    def inv_quant(self, Y):
-        """Undo quantisation to get big numbers"""
-        return Y
+    def inv_quantise(self, Y):
+        """Quantise as integers"""
+        Yq = np.zeros_like(Y)
+
+        for i in range(self.n):
+
+            m = 256//(2**i) # 256, 128, 64 ... 
+            h = m//2 # Midpoint: 128, 64, 32 ...
+
+            # Quantising
+            Yq[:h, h:m] = inv_quant(Y[:h, h:m], self.steps[0, i]) # Top right 
+            Yq[h:m, :h] = inv_quant(Y[h:m, :h], self.steps[1, i]) # Bottom left
+            Yq[h:m, h:m] = inv_quant(Y[h:m, h:m], self.steps[2, i]) # Bottom right
+
+        # Final low pass image
+        m = 256//(2**self.n)
+        Yq[:m, :m] = inv_quant(Y[:m, :m], self.steps[0, self.n])
+
+        return Yq.astype(int)
 
     def encode(self, Y: np.ndarray, M: Optional[int] = None, dcbits: int = 8) -> Tuple[np.ndarray, HuffmanTable]:
         """Pass in a transformed image, Y, and
          - regroup
          - quantise
          - generate huffman encoding"""
-        Yr = dwtgroup(Y, self.n)
-        # Yq = self.quantise(Yr)
+        Yq = self.quantise(Y)
 
-        Yq = Yr.astype(int)
+        Yq = dwtgroup(Yq, self.n)
+        self.A = Yq
+
 
         N = np.round(2**self.n)
         if M is None:
@@ -214,7 +236,7 @@ class DWTCompression:
         scan = diagscan(M)
 
         huffhist = np.zeros(16 ** 2)
-
+        t = perf_counter()
         # First pass to generate histogram
         for r in range(0, Yq.shape[0], M):
             for c in range(0, Yq.shape[1], M):
@@ -231,7 +253,8 @@ class DWTCompression:
         vlc = []
         dhufftab = huffdes(huffhist)
         huffcode, ehuf = huffgen(dhufftab)
-
+        print(f"{perf_counter() - t:.4f} 1st pass")
+        t = perf_counter()
         for r in range(0, Yq.shape[0], M):
             for c in range(0, Yq.shape[1], M):
                 yq = Yq[r:r+M,c:c+M]
@@ -241,16 +264,17 @@ class DWTCompression:
                 yqflat = yq.flatten('F')
                 # Encode DC coefficient first
                 dccoef = yqflat[0] + 2 ** (dcbits-1)
-                if dccoef not in range(2**dcbits):
+                if dccoef > 2**dcbits:
                     raise ValueError(
                         'DC coefficients too large for desired number of bits')
                 vlc.append(np.array([[dccoef, dcbits]]))
                 # Encode the other AC coefficients in scan order
                 # huffenc() also updates huffhist.
                 ra1 = runampl(yqflat[scan])
-                vlc.append(huffenc(huffhist, ra1, ehuf))
+                vlc.append(huffencopt(ra1, ehuf))
         # (0, 2) array makes this work even if `vlc == []`
         vlc = np.concatenate([np.zeros((0, 2), dtype=np.intp)] + vlc)
+        print(f"{perf_counter() - t:.4f} 2nd pass")
 
         self.hufftab = dhufftab
 
@@ -270,8 +294,6 @@ class DWTCompression:
 
         k = 2 ** np.arange(17) # Define array of powers of 2 from 1 to 2^16.
 
-
-
         # For each block in the image:
 
         # Decode the dc coef (a fixed-length word)
@@ -285,11 +307,7 @@ class DWTCompression:
         i = 0
         Zq = np.zeros(self.img_size)
 
-         # number of DC bits to encode 
-        qstep = 16 # another mystery parameter of this process
-
         W, H = self.img_size
-
         for r in range(0, H, M):
             for c in range(0, W, M):
                 yq = np.zeros(M**2)
@@ -302,10 +320,10 @@ class DWTCompression:
                 yq[cf] = vlc[i, 0] - 2 ** (dcbits-1)
                 i += 1
 
-                while np.any(vlc[i] != eob): # Loop for each non-zero AC coef.
+                while vlc[i, 0] != eob[0]: # Loop for each non-zero AC coef.
                     run = 0
-                    
-                    while np.all(vlc[i] == run16): # Decode any runs of 16 zeros first.
+
+                    while vlc[i, 0] == run16[0]: # Decode any runs of 16 zeros first.
                         run += 16
                         i += 1
 
@@ -317,8 +335,7 @@ class DWTCompression:
                     si = res % 16
                     i += 1
                     
-                    if vlc[i, 1] != si: # Decode amplitude of AC coef.
-                        raise ValueError('Problem with decoding .. you might be using the wrong hufftab table')
+                    # Assume no problem with Huffman table/decoding
                     ampl = vlc[i, 0]
 
                     thr = k[si - 1] # Adjust ampl for negative coef (i.e. MSB = 0).
@@ -333,11 +350,9 @@ class DWTCompression:
                     yq = regroup(yq, M//N)
 
                 Zq[r:r+M, c:c+M] = yq
-
-        Zi = self.inv_quant(Zq)
-
-        Z =  dwtgroup(Zi, -self.n)
-        # Z = Zr
+        print(np.std( Zq - self.A ), '!')
+        Zq = dwtgroup(Zq, -self.n)
+        Z = self.inv_quantise(Zq)
         return Z
 
 
