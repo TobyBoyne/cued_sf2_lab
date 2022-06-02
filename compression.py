@@ -395,9 +395,8 @@ class LBTCompression:
 
 class DWTCompression:
     
-    def __init__(self, n: int, steps: np.ndarray, log: bool = True):
+    def __init__(self, n: int, log: bool = True):
         self.n = n
-        self.steps = steps
         self.log = log
 
         self.hufftab = None
@@ -421,9 +420,8 @@ class DWTCompression:
 
         return Yr
 
-    def quantise(self, Y):
-        """Quantise as integers"""
-        Yq = np.zeros_like(Y)
+    def estimate_entropy(self, Y):
+        """Estimate the entropy of the image by considering coding each block"""
         dwtent = 0
 
         for i in range(self.n):
@@ -431,24 +429,30 @@ class DWTCompression:
             m = 256//(2**i) # 256, 128, 64 ... 
             h = m//2 # Midpoint: 128, 64, 32 ...
 
-            # Quantising
-            Yq[:h, h:m] = quant(Y[:h, h:m], self.steps[0, i]) # Top right 
-            Yq[h:m, :h] = quant(Y[h:m, :h], self.steps[1, i]) # Bottom left
-            Yq[h:m, h:m] = quant(Y[h:m, h:m], self.steps[2, i]) # Bottom right
-
-            dwtent += img_size(Yq[:h, h:m]) + img_size(Yq[h:m, :h]) + img_size(Yq[h:m, h:m])
+            dwtent += img_size(Y[:h, h:m]) + img_size(Y[h:m, :h]) + img_size(Y[h:m, h:m])
 
         # Final low pass image
+        dwtent += img_size(Y[:m, :m])
 
-        # Yq[128:, 128:] = 0
+        return dwtent
 
-        m = 256//(2**self.n)
-        Yq[:m, :m] = quant(Y[:m, :m], self.steps[0, self.n])
-        self.ent = dwtent + img_size(Yq[:m, :m])
+    def constant_steps(self, step: float = 1.):
+        dwtstep = np.ones((3, self.n)) * step
+        dwtstep = np.concatenate((dwtstep, np.ones((3, 1))), axis=1)
 
-        return Yq.astype(int)
+        return dwtstep
 
-    def inv_quantise(self, Y):
+    def equal_mse_steps(self, initial: float = 1.,ratio: float = 2.):
+        """Return a (3 x N+1) np array of step sizes with constant ratio"""
+        const_ratio = np.logspace(start=self.n-1, stop=0, num=self.n, base=ratio) * initial
+        dwtstep = np.stack((const_ratio, const_ratio, const_ratio * np.sqrt(2)))
+
+        # append ones for DC component
+        dwtstep = np.concatenate((dwtstep, np.ones((3, 1))), axis=1)
+        return dwtstep
+
+
+    def quantise(self, Y, steps: np.ndarray, rise=None):
         """Quantise as integers"""
         Yq = np.zeros_like(Y)
 
@@ -458,22 +462,49 @@ class DWTCompression:
             h = m//2 # Midpoint: 128, 64, 32 ...
 
             # Quantising
-            Yq[:h, h:m] = inv_quant(Y[:h, h:m], self.steps[0, i]) # Top right 
-            Yq[h:m, :h] = inv_quant(Y[h:m, :h], self.steps[1, i]) # Bottom left
-            Yq[h:m, h:m] = inv_quant(Y[h:m, h:m], self.steps[2, i]) # Bottom right
+            Yq[:h, h:m] = quant(Y[:h, h:m], steps[0, i], rise) # Top right 
+            Yq[h:m, :h] = quant(Y[h:m, :h], steps[1, i], rise) # Bottom left
+            Yq[h:m, h:m] = quant(Y[h:m, h:m], steps[2, i], rise) # Bottom right
 
         # Final low pass image
+
+        # Yq[128:, 128:] = 0
+
         m = 256//(2**self.n)
-        Yq[:m, :m] = inv_quant(Y[:m, :m], self.steps[0, self.n])
+        Yq[:m, :m] = quant(Y[:m, :m], steps[0, self.n], rise)
 
         return Yq.astype(int)
 
-    def encode(self, Y: np.ndarray, M: Optional[int] = None, dcbits: int = 8) -> Tuple[np.ndarray, HuffmanTable]:
+    def inv_quantise(self, Y, steps: np.ndarray, rise=None):
+        """Quantise as integers"""
+        Yq = np.zeros_like(Y)
+
+        for i in range(self.n):
+
+            m = 256//(2**i) # 256, 128, 64 ... 
+            h = m//2 # Midpoint: 128, 64, 32 ...
+
+            # Quantising
+            Yq[:h, h:m] = inv_quant(Y[:h, h:m], steps[0, i], rise) # Top right 
+            Yq[h:m, :h] = inv_quant(Y[h:m, :h], steps[1, i], rise) # Bottom left
+            Yq[h:m, h:m] = inv_quant(Y[h:m, h:m], steps[2, i], rise) # Bottom right
+
+        # Final low pass image
+        m = 256//(2**self.n)
+        Yq[:m, :m] = inv_quant(Y[:m, :m], steps[0, self.n], rise)
+
+        return Yq.astype(int)
+
+    def encode(self, Y: np.ndarray, M: Optional[int] = None, dcbits: int = 8,
+        dwtsteps=None) -> Tuple[np.ndarray, HuffmanTable]:
         """Pass in a transformed image, Y, and
          - regroup
          - quantise
          - generate huffman encoding"""
-        Yq = self.quantise(Y)
+        if dwtsteps is None:
+            dwtsteps = self.constant_steps()
+
+        Yq = self.quantise(Y, dwtsteps)
 
         Yq = dwtgroup(Yq, self.n)
         self.A = Yq
@@ -504,8 +535,7 @@ class DWTCompression:
         vlc = []
         dhufftab = huffdes(huffhist)
         huffcode, ehuf = huffgen(dhufftab)
-        print(f"{perf_counter() - t:.4f} 1st pass")
-        t = perf_counter()
+
         for r in range(0, Yq.shape[0], M):
             for c in range(0, Yq.shape[1], M):
                 yq = Yq[r:r+M,c:c+M]
@@ -525,16 +555,18 @@ class DWTCompression:
                 vlc.append(huffencopt(ra1, ehuf))
         # (0, 2) array makes this work even if `vlc == []`
         vlc = np.concatenate([np.zeros((0, 2), dtype=np.intp)] + vlc)
-        print(f"{perf_counter() - t:.4f} 2nd pass")
 
         self.hufftab = dhufftab
 
         return (vlc, dhufftab) # "variable length code" and header (huffman table "hufftab" or other)
 
-    def decode(self, vlc: np.ndarray, N: int = 8, M: Optional[int] = None, dcbits: int = 8, log: bool = True) -> np.ndarray:
+    def decode(self, vlc: np.ndarray, N: int = 8, M: Optional[int] = None, dcbits: int = 8, dwtsteps = None) -> np.ndarray:
 
         if M is None:
             M = N
+
+        if dwtsteps is None:
+            dwtsteps = self.constant_steps()
 
         scan = diagscan(M)
         hufftab = self.hufftab
@@ -601,9 +633,9 @@ class DWTCompression:
                     yq = regroup(yq, M//N)
 
                 Zq[r:r+M, c:c+M] = yq
-        print(np.std( Zq - self.A ), '!')
+
         Zq = dwtgroup(Zq, -self.n)
-        Z = self.inv_quantise(Zq)
+        Z = self.inv_quantise(Zq, dwtsteps)
         return Z
 
 
