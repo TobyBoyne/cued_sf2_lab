@@ -101,8 +101,9 @@ class DCTCompression:
 
 class LBTCompression:
 
-    def __init__(self, s: float = 1.6, N: int = 8):
+    def __init__(self, s: float = 1.3, N: int = 8):
         
+        self.name = "LBT"
         self.N = N
         self.Pf, self.Pr = pot_ii(N, s=s)
         self.DCT = DCTCompression(N)
@@ -125,13 +126,11 @@ class LBTCompression:
         Zp[t,:] = colxfm(Zp[t,:], self.Pr.T)
         return Zp
 
-    
     def compress(self, X: np.ndarray) -> np.ndarray:
 
         Xp = self.pre_filter(X)
 
         return self.DCT.compress(Xp)
-
 
     def decompress(self, Y: np.ndarray) -> np.ndarray:
 
@@ -139,13 +138,53 @@ class LBTCompression:
 
         return self.post_filter(Z)
 
+    def quant(self, Y: np.ndarray, step: float) -> np.ndarray:
 
-    def encode(self, Y: np.ndarray, qstep: float, M: int = 8, dcbits: int = 8, log: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        N = self.N
+        width = Y.shape[0]
+        h = width//N
+
+        Yr = regroup(Y, N)
+        Yr[0:N, 0:N] = quant(Yr[0:N, 0:N], step)
+
+        for i in range(1, 2*h):
+            for j in range(i+1):
+
+                Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N] = quant(Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N], step*((1.6)**(max(1, i-12))))
+
+        Yr = regroup(Yr, h) / h
+
+        return Yr
+
+
+    def inv_quant(self, Y: np.ndarray, step: float) -> np.ndarray:
+
+        N = self.N
+        width = Y.shape[0]
+        h = width//N
+
+        Yr = regroup(Y, N)
+        Yr[0:N, 0:N] = quant(Yr[0:N, 0:N], step)
+
+        for i in range(1, 2*h):
+            for j in range(i+1):
+
+                Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N] = inv_quant(Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N], step*((1.6)**(max(1, i-12))))
+
+        Yr = regroup(Yr, h) / h
+
+        return Yr
+
+
+    def encode(self, Y: np.ndarray, qstep: float, M: int = 8, dcbits: int = 8, log: bool = False, quant_grad=False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Pass in a transformed image, Y, and
          - regroup
          - quantise
          - generate huffman encoding"""
-        Yq = quant1(Y, qstep, qstep).astype('int')
+        if quant_grad:
+            Yq = self.quant(Y, qstep).astype('int')
+        else:
+            Yq = quant(Y, qstep).astype('int')
 
         # Generate zig-zag scan of AC coefs.
         scan = diagscan(M)
@@ -168,7 +207,6 @@ class LBTCompression:
         vlc = []
         dhufftab = huffdes(huffhist)
         huffcode, ehuf = huffgen(dhufftab)
-        print(f"{perf_counter() - t:.4f} 1st pass")
         t = perf_counter()
         for r in range(0, Yq.shape[0], M):
             for c in range(0, Yq.shape[1], M):
@@ -189,15 +227,13 @@ class LBTCompression:
                 vlc.append(huffencopt(ra1, ehuf))
         # (0, 2) array makes this work even if `vlc == []`
         vlc = np.concatenate([np.zeros((0, 2), dtype=np.intp)] + vlc)
-        print(f"{perf_counter() - t:.4f} 2nd pass")
 
         return (vlc, dhufftab) # "variable length code" and header (huffman table "hufftab" or other)
 
-
-    def decode(self, vlc: np.ndarray, qstep: float, M: int = 8,
+    def decode(self, vlc: np.ndarray, qstep: float = 17, M: int = 8,
             hufftab: Optional[HuffmanTable] = None,
-            dcbits: int = 8, W: int = 256, H: int = 256, log: bool = False
-            ) -> np.ndarray:
+            dcbits: int = 8, W: int = 256, H: int = 256, log: bool = False,
+            quant_grad=False) -> np.ndarray:
         '''
         Decodes a (simplified) JPEG bit stream to an image
 
@@ -314,7 +350,12 @@ class LBTCompression:
         if log:
             print('Inverse quantising to step size of {}'.format(qstep))
 
-        Zi = quant2(Zq, qstep, qstep)
+        if quant_grad:
+            Zi = self.inv_quant(Zq, qstep)
+        else:
+            Zi = inv_quant(Zq, qstep)
+
+        
 
         if log:
             print('Inverse {} x {} DCT\n'.format(self.N, self.N))
@@ -322,20 +363,18 @@ class LBTCompression:
         return Zi
 
 
-    def opt_encode(self, Y: np.ndarray, size_lim=40960) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def opt_encode(self, Y: np.ndarray, size_lim=40960,  M: int = 8, quant_grad=False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         
-        def error(qstep: int) -> int:
+        def error(qstep: float) -> int:
 
-            Z, h = self.encode(Y, qstep)
+            Z, h = self.encode(Y, qstep, M=M, quant_grad=quant_grad)
             size = Z[:, 1].sum()
 
             return np.sum((size - size_lim)**2)
 
-        res = optimize.minimize_scalar(error, method="bounded", bounds=(16, 128))
+        res = optimize.minimize_scalar(error, method="bounded", bounds=(1, 32))
 
-        vlc, hufftab = self.encode(Y, res.x)
-
-        diff = vlc[:, 1].sum() - size_lim
+        vlc, hufftab = self.encode(Y, res.x, M=M, quant_grad=quant_grad)
 
         return (vlc, hufftab), res.x
 
@@ -345,10 +384,9 @@ class LBTCompression:
 class DWTCompression:
     
     def __init__(self, n: int, log: bool = True):
+        self.name = "DWT"
         self.n = n
         self.log = log
-
-        self.hufftab = None
         self.img_size = (256, 256)
 
     def compress(self, X: np.ndarray):
@@ -391,15 +429,17 @@ class DWTCompression:
 
         return dwtstep
 
-    def equal_mse_steps(self, initial: float = 1.,ratio: float = 2.):
+    def equal_mse_steps(self, initial: float = 1.,ratio: float = 2., root2: bool = True):
         """Return a (3 x N+1) np array of step sizes with constant ratio"""
-        const_ratio = np.logspace(start=self.n-1, stop=0, num=self.n, base=ratio) * initial
-        dwtstep = np.stack((const_ratio, const_ratio, const_ratio * np.sqrt(2)))
 
-        # append ones for DC component
-        dwtstep = np.concatenate((dwtstep, np.ones((3, 1))), axis=1)
+        if root2:
+            const_ratio = np.logspace(start=self.n-1, stop=0, num=self.n, base=ratio) * initial
+            dwtstep = np.stack((const_ratio, const_ratio, const_ratio * np.sqrt(2)))
+            # append ones for DC component
+            dwtstep = np.concatenate((dwtstep, np.ones((3, 1))), axis=1)
+        else:
+            dwtstep = np.array([np.ones((1, 3))[0]*initial*(0.5**i) for i in range(self.n + 1)]).T
         return dwtstep
-
 
     def quantise(self, Y, steps: np.ndarray, rise=None):
         """Quantise as integers"""
@@ -444,16 +484,18 @@ class DWTCompression:
 
         return Yq.astype(int)
 
-    def encode(self, Y: np.ndarray, M: Optional[int] = None, dcbits: int = 8,
-        dwtsteps=None) -> Tuple[np.ndarray, HuffmanTable]:
+    def encode(self, Y: np.ndarray, qstep: Optional[int] = None, M: Optional[int] = None, dcbits: int = 16, rise=None, root2: bool=True) -> Tuple[np.ndarray, HuffmanTable]:
         """Pass in a transformed image, Y, and
          - regroup
          - quantise
          - generate huffman encoding"""
-        if dwtsteps is None:
-            dwtsteps = self.constant_steps()
 
-        Yq = self.quantise(Y, dwtsteps)
+        if qstep is None:
+            dwtsteps = self.constant_steps()
+        else:
+            dwtsteps=self.equal_mse_steps(qstep, root2=root2)
+
+        Yq = self.quantise(Y, dwtsteps, rise=rise)
 
         Yq = dwtgroup(Yq, self.n)
         self.A = Yq
@@ -505,20 +547,21 @@ class DWTCompression:
         # (0, 2) array makes this work even if `vlc == []`
         vlc = np.concatenate([np.zeros((0, 2), dtype=np.intp)] + vlc)
 
-        self.hufftab = dhufftab
-
         return (vlc, dhufftab) # "variable length code" and header (huffman table "hufftab" or other)
 
-    def decode(self, vlc: np.ndarray, N: int = 8, M: Optional[int] = None, dcbits: int = 8, dwtsteps = None) -> np.ndarray:
+    def decode(self, vlc: np.ndarray, qstep: Optional[int] = None, hufftab: Optional[HuffmanTable] = None, N: int = 8, M: Optional[int] = None, dcbits: int = 16, rise=None, root2: bool=True) -> np.ndarray:
+
+        N = np.round(2**self.n)
 
         if M is None:
             M = N
 
-        if dwtsteps is None:
+        if qstep is None:
             dwtsteps = self.constant_steps()
+        else:
+            dwtsteps = self.equal_mse_steps(qstep, root2=root2)
 
         scan = diagscan(M)
-        hufftab = self.hufftab
 
         # Define starting addresses of each new code length in huffcode.
         huffstart = np.cumsum(np.block([0, hufftab.bits[:15]]))
@@ -584,8 +627,22 @@ class DWTCompression:
                 Zq[r:r+M, c:c+M] = yq
 
         Zq = dwtgroup(Zq, -self.n)
-        Z = self.inv_quantise(Zq, dwtsteps)
+        Z = self.inv_quantise(Zq, dwtsteps, rise=rise)
         return Z
+
+    def opt_encode(self, Y: np.ndarray, size_lim=40960, M: int = 8, root2: bool=True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+            
+        def error(qstep: int) -> int:
+
+            Z, h = self.encode(Y, qstep=qstep, rise=None, root2=root2)
+            size = Z[:, 1].sum()
+
+            return np.sum((size - size_lim)**2)
+
+        opt_step = optimize.minimize_scalar(error, method="bounded", bounds=(0, 64)).x
+        vlc, hufftab = self.encode(Y, qstep=opt_step, rise=None, root2=root2)
+
+        return (vlc, hufftab), opt_step
 
 
 class SVDCompression:
