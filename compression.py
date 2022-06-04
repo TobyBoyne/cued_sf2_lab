@@ -441,50 +441,57 @@ class DWTCompression:
             dwtstep = np.array([np.ones((1, 3))[0]*initial*(0.5**i) for i in range(self.n + 1)]).T
         return dwtstep
 
-    def quantise(self, Y, steps: np.ndarray, rise=None):
+    def quantise(self, Y, steps: np.ndarray, rise_ratio=None):
         """Quantise as integers"""
         Yq = np.zeros_like(Y)
-
+        if rise_ratio is None: rise_ratio = 0.5
         for i in range(self.n):
 
             m = 256//(2**i) # 256, 128, 64 ... 
             h = m//2 # Midpoint: 128, 64, 32 ...
 
             # Quantising
-            Yq[:h, h:m] = quant(Y[:h, h:m], steps[0, i], rise) # Top right 
-            Yq[h:m, :h] = quant(Y[h:m, :h], steps[1, i], rise) # Bottom left
-            Yq[h:m, h:m] = quant(Y[h:m, h:m], steps[2, i], rise) # Bottom right
+            s_tr = max(steps[0, i], 1)
+            s_bl = max(steps[1, i], 1)
+            s_br = max(steps[2, i], 1)
+
+            Yq[:h, h:m] = quant(Y[:h, h:m],s_tr, s_tr * rise_ratio) # Top right 
+            Yq[h:m, :h] = quant(Y[h:m, :h], s_bl, s_bl * rise_ratio) # Bottom left
+            Yq[h:m, h:m] = quant(Y[h:m, h:m], s_br, s_br * rise_ratio) # Bottom right
 
         # Final low pass image
 
         # Yq[128:, 128:] = 0
 
         m = 256//(2**self.n)
-        Yq[:m, :m] = quant(Y[:m, :m], steps[0, self.n], rise)
+        s_tr = max(steps[0, self.n], 1)
+        Yq[:m, :m] = quant(Y[:m, :m], s_tr, s_tr * rise_ratio)
 
         return Yq.astype(int)
 
-    def inv_quantise(self, Y, steps: np.ndarray, rise=None):
+    def inv_quantise(self, Y, steps: np.ndarray, rise_ratio=None):
         """Quantise as integers"""
         Yq = np.zeros_like(Y)
-
+        if rise_ratio is None: rise_ratio = 0.5
         for i in range(self.n):
-
             m = 256//(2**i) # 256, 128, 64 ... 
             h = m//2 # Midpoint: 128, 64, 32 ...
 
-            # Quantising
-            Yq[:h, h:m] = inv_quant(Y[:h, h:m], steps[0, i], rise) # Top right 
-            Yq[h:m, :h] = inv_quant(Y[h:m, :h], steps[1, i], rise) # Bottom left
-            Yq[h:m, h:m] = inv_quant(Y[h:m, h:m], steps[2, i], rise) # Bottom right
+            s_tr = max(steps[0, i], 1)
+            s_bl = max(steps[1, i], 1)
+            s_br = max(steps[2, i], 1)
+
+            Yq[:h, h:m] = inv_quant(Y[:h, h:m],s_tr, s_tr * rise_ratio) # Top right 
+            Yq[h:m, :h] = inv_quant(Y[h:m, :h], s_bl, s_bl * rise_ratio) # Bottom left
+            Yq[h:m, h:m] = inv_quant(Y[h:m, h:m], s_br, s_br * rise_ratio) # Bottom right
 
         # Final low pass image
         m = 256//(2**self.n)
-        Yq[:m, :m] = inv_quant(Y[:m, :m], steps[0, self.n], rise)
-
+        s_tr = max(steps[0, self.n], 1)
+        Yq[:m, :m] = quant(Y[:m, :m], s_tr, s_tr * rise_ratio)
         return Yq.astype(int)
 
-    def encode(self, Y: np.ndarray, qstep: Optional[int] = None, M: Optional[int] = None, dcbits: int = 16, rise=None, root2: bool=True) -> Tuple[np.ndarray, HuffmanTable]:
+    def encode(self, Y: np.ndarray, qstep: Optional[int] = None, M: Optional[int] = None, dcbits: int = 16, rise_ratio=None, root2: bool=True) -> Tuple[np.ndarray, HuffmanTable]:
         """Pass in a transformed image, Y, and
          - regroup
          - quantise
@@ -495,7 +502,7 @@ class DWTCompression:
         else:
             dwtsteps=self.equal_mse_steps(qstep, root2=root2)
 
-        Yq = self.quantise(Y, dwtsteps, rise=rise)
+        Yq = self.quantise(Y, dwtsteps, rise_ratio=rise_ratio)
 
         Yq = dwtgroup(Yq, self.n)
         self.A = Yq
@@ -549,7 +556,7 @@ class DWTCompression:
 
         return (vlc, dhufftab) # "variable length code" and header (huffman table "hufftab" or other)
 
-    def decode(self, vlc: np.ndarray, qstep: Optional[int] = None, hufftab: Optional[HuffmanTable] = None, N: int = 8, M: Optional[int] = None, dcbits: int = 16, rise=None, root2: bool=True) -> np.ndarray:
+    def decode(self, vlc: np.ndarray, qstep: Optional[int] = None, hufftab: Optional[HuffmanTable] = None, N: int = 8, M: Optional[int] = None, dcbits: int = 16, rise_ratio=None, root2: bool=True) -> np.ndarray:
 
         N = np.round(2**self.n)
 
@@ -627,20 +634,20 @@ class DWTCompression:
                 Zq[r:r+M, c:c+M] = yq
 
         Zq = dwtgroup(Zq, -self.n)
-        Z = self.inv_quantise(Zq, dwtsteps, rise=rise)
+        Z = self.inv_quantise(Zq, dwtsteps, rise_ratio=rise_ratio)
         return Z
 
-    def opt_encode(self, Y: np.ndarray, size_lim=40960, M: int = 8, root2: bool=True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def opt_encode(self, Y: np.ndarray, size_lim=40960, M: int = 8, root2: bool=True, rise_ratio=None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
             
         def error(qstep: int) -> int:
 
-            Z, h = self.encode(Y, qstep=qstep, rise=None, root2=root2)
+            Z, h = self.encode(Y, qstep=qstep, rise_ratio=rise_ratio, root2=root2)
             size = Z[:, 1].sum()
 
             return np.sum((size - size_lim)**2)
 
-        opt_step = optimize.minimize_scalar(error, method="bounded", bounds=(1, 64)).x
-        vlc, hufftab = self.encode(Y, qstep=opt_step, rise=None, root2=root2)
+        opt_step = optimize.minimize_scalar(error, method="bounded", bounds=(0.1, 64)).x
+        vlc, hufftab = self.encode(Y, qstep=opt_step, rise_ratio=rise_ratio, root2=root2)
 
         return (vlc, hufftab), opt_step
 
