@@ -150,7 +150,7 @@ class LBTCompression:
         for i in range(1, 2*h):
             for j in range(i+1):
 
-                Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N] = quant(Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N], step*((1.6)**(max(1, i-12))))
+                Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N] = quant(Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N], step*((1.3)**(max(1, i-12))))
 
         Yr = regroup(Yr, h) / h
 
@@ -169,7 +169,7 @@ class LBTCompression:
         for i in range(1, 2*h):
             for j in range(i+1):
 
-                Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N] = inv_quant(Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N], step*((1.6)**(max(1, i-12))))
+                Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N] = inv_quant(Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N], step*((1.3)**(max(1, i-12))))
 
         Yr = regroup(Yr, h) / h
 
@@ -372,7 +372,7 @@ class LBTCompression:
 
             return np.sum((size - size_lim)**2)
 
-        res = optimize.minimize_scalar(error, method="bounded", bounds=(1, 32))
+        res = optimize.minimize_scalar(error, method="bounded", bounds=(1 if quant_grad else 4, 32 if quant_grad else 128))
 
         vlc, hufftab = self.encode(Y, res.x, M=M, quant_grad=quant_grad)
 
@@ -639,7 +639,7 @@ class DWTCompression:
 
             return np.sum((size - size_lim)**2)
 
-        opt_step = optimize.minimize_scalar(error, method="bounded", bounds=(0, 64)).x
+        opt_step = optimize.minimize_scalar(error, method="bounded", bounds=(1, 64)).x
         vlc, hufftab = self.encode(Y, qstep=opt_step, rise=None, root2=root2)
 
         return (vlc, hufftab), opt_step
