@@ -107,6 +107,7 @@ class LBTCompression:
         self.N = N
         self.Pf, self.Pr = pot_ii(N, s=s)
         self.DCT = DCTCompression(N)
+        self.grad_r = 1.039
 
     def pre_filter(self, X: np.ndarray) -> np.ndarray:
 
@@ -145,17 +146,16 @@ class LBTCompression:
         h = width//N
 
         Yr = regroup(Y, N)
-        Yr[0:N, 0:N] = quant(Yr[0:N, 0:N], step)
+        Yr[0:N, 0:N] = quant(Yr[0:N, 0:N], 1)
 
         for i in range(1, 2*h):
             for j in range(i+1):
 
-                Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N] = quant(Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N], max(1, step)*((1.0455)**i))
+                Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N] = quant(Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N], step*((1.3)**(max(1, i-12))))
 
         Yr = regroup(Yr, h) / h
 
         return Yr
-
 
     def inv_quant(self, Y: np.ndarray, step: float) -> np.ndarray:
 
@@ -163,28 +163,73 @@ class LBTCompression:
         width = Y.shape[0]
         h = width//N
 
-        Yr = regroup(Y, N)
-        Yr[0:N, 0:N] = quant(Yr[0:N, 0:N], step)
+        Yr = regroup(Y, N) * N
+        Yr[0:N, 0:N] = inv_quant(Yr[0:N, 0:N], 1)
 
         for i in range(1, 2*h):
             for j in range(i+1):
 
-                Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N] = inv_quant(Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N], max(1, step)*((1.035)**i))
+                Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N] = inv_quant(Yr[(i-j)*N:(i-j+1)*N, j*N:(j+1)*N], step*((1.3)**(max(1, i-12))))
 
-        Yr = regroup(Yr, h) * h
+        Yr = regroup(Yr, h)
 
         return Yr
 
+    def quant2(self, Y: np.ndarray, step: float) -> np.ndarray:
+        
+        N = self.N
+        Yq = Y.copy()
 
-    def encode(self, Y: np.ndarray, qstep: float, M: int = 8, dcbits: int = 10, log: bool = False, quant_grad=False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        x = np.arange(N)
+        steps = step * (self.grad_r ** np.add.outer(x, x))
+        steps = np.maximum(steps, 1)
+
+        # Yr = regroup(Y, N)
+
+        for i in range(N):
+            for j in range(N):
+
+                if j == i == 0:
+
+                    Yq[i::N, j::N] = quant(Y[i::N, j::N], 1)
+
+                else:
+
+                    Yq[i::N, j::N] = quant(Y[i::N, j::N], steps[i, j])           
+
+        return Yq
+
+    def inv_quant2(self, Y: np.ndarray, step: float) -> np.ndarray:
+
+        N = self.N
+        Yq = Y.copy()
+
+        x = np.arange(N)
+        steps = step * (self.grad_r ** np.add.outer(x, x))
+        steps = np.maximum(steps, 1)
+
+        for i in range(N):
+            for j in range(N):
+
+                if j == i == 0:
+
+                    Yq[i::N, j::N] = inv_quant(Y[i::N, j::N], 1)
+
+                else:
+
+                    Yq[i::N, j::N] = inv_quant(Y[i::N, j::N],  steps[i, j])
+
+        return Yq
+
+    def encode(self, Y: np.ndarray, qstep: float, M: int = 8, dcbits: int = 16, log: bool = False, quant_grad=False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Pass in a transformed image, Y, and
          - regroup
          - quantise
          - generate huffman encoding"""
         if quant_grad:
-            Yq = self.quant(Y, qstep).astype('int')
+            Yq = self.quant(Y, qstep).astype(int)
         else:
-            Yq = quant(Y, qstep).astype('int')
+            Yq = self.quant2(Y, qstep).astype(int)
 
         # Generate zig-zag scan of AC coefs.
         scan = diagscan(M)
@@ -232,7 +277,7 @@ class LBTCompression:
 
     def decode(self, vlc: np.ndarray, qstep: float = 17, M: int = 8,
             hufftab: Optional[HuffmanTable] = None,
-            dcbits: int = 10, W: int = 256, H: int = 256, log: bool = False,
+            dcbits: int = 16, W: int = 256, H: int = 256, log: bool = False,
             quant_grad=False) -> np.ndarray:
         '''
         Decodes a (simplified) JPEG bit stream to an image
@@ -353,7 +398,7 @@ class LBTCompression:
         if quant_grad:
             Zi = self.inv_quant(Zq, qstep)
         else:
-            Zi = inv_quant(Zq, qstep)
+            Zi = self.inv_quant2(Zq, qstep)
 
         
 
@@ -372,7 +417,7 @@ class LBTCompression:
 
             return np.sum((size - size_lim)**2)
 
-        res = optimize.minimize_scalar(error, method="bounded", bounds=(0.1 if quant_grad else 4, 32 if quant_grad else 128))
+        res = optimize.minimize_scalar(error, method="bounded", bounds=(1 if quant_grad else 16, 4 if quant_grad else 128))
 
         vlc, hufftab = self.encode(Y, res.x, M=M, quant_grad=quant_grad)
 
@@ -433,13 +478,13 @@ class DWTCompression:
         """Return a (3 x N+1) np array of step sizes with constant ratio"""
 
         if root2:
-            const_ratio = np.logspace(start=self.n-1, stop=0, num=self.n, base=ratio) * initial
+            const_ratio = np.logspace(start=self.n, stop=0, num=self.n, base=ratio) * initial
             dwtstep = np.stack((const_ratio, const_ratio, const_ratio * np.sqrt(2)))
-            # append ones for DC component
+            # append ones for DC componenta
             dwtstep = np.concatenate((dwtstep, np.ones((3, 1))), axis=1)
         else:
             dwtstep = np.array([np.ones((1, 3))[0]*initial*(0.5**i) for i in range(self.n + 1)]).T
-        
+
         return dwtstep
 
     def quantise(self, Y, steps: np.ndarray, rise_ratio=None):
@@ -489,7 +534,7 @@ class DWTCompression:
         # Final low pass image
         m = 256//(2**self.n)
         s_tr = max(steps[0, self.n], 1)
-        Yq[:m, :m] = quant(Y[:m, :m], s_tr, s_tr * rise_ratio)
+        Yq[:m, :m] = inv_quant(Y[:m, :m], s_tr, s_tr * rise_ratio)
         return Yq.astype(int)
 
     def encode(self, Y: np.ndarray, qstep: Optional[int] = None, M: Optional[int] = None, dcbits: int = 16, rise_ratio=None, root2: bool=True) -> Tuple[np.ndarray, HuffmanTable]:
